@@ -138,25 +138,26 @@ function findInputSlot(node, name) {
 /**
  * Rebuild the source_map and refresh sel_{cat} COMBO options based on current connections.
  * Always keeps exactly one trailing empty encoded_N slot.
+ *
+ * Must be called deferred (setTimeout) so that graph.links is fully updated first.
  */
 function refreshComboNode(node) {
-    if (!node.inputs) node.inputs = [];
+    if (!node.graph || !node.inputs) return;
 
-    // Collect all encoded_* input slots in order
     const encSlots = node.inputs.filter((inp) => inp.name?.startsWith("encoded_"));
 
-    // Determine which slots are connected and build source_map
+    // Build source_map from connected slots
     const sourceMap = {};
     const connectedSlots = [];
     for (const inp of encSlots) {
-        const link = inp.link != null ? node.graph?.links?.[inp.link] : null;
-        if (link) {
-            const srcNode = node.graph?.getNodeById(link.origin_id);
-            const info = getSourceInfo(srcNode);
-            if (info) {
-                sourceMap[info.title] = inp.name;
-                connectedSlots.push({ slotName: inp.name, info });
-            }
+        if (inp.link == null) continue;
+        const link = node.graph.links[inp.link];
+        if (!link) continue;
+        const srcNode = node.graph.getNodeById(link.origin_id);
+        const info = getSourceInfo(srcNode);
+        if (info) {
+            sourceMap[info.title] = inp.name;
+            connectedSlots.push({ slotName: inp.name, info });
         }
     }
 
@@ -164,37 +165,30 @@ function refreshComboNode(node) {
     if (!node.properties) node.properties = {};
     node.properties._source_map = sourceMap;
 
-    // Ensure there is exactly one trailing unconnected encoded_N slot
-    const lastSlot = encSlots[encSlots.length - 1];
-    const lastConnected = lastSlot?.link != null;
+    // Ensure exactly one trailing unconnected slot
+    // Re-read after potential modifications
+    const slots = node.inputs.filter((inp) => inp.name?.startsWith("encoded_"));
+    const last = slots[slots.length - 1];
 
-    if (!lastSlot || lastConnected) {
-        // Add a new empty slot
-        const nextN = encSlots.length + 1;
-        node.addInput(`encoded_${nextN}`, "ENCODED_PROMPT");
+    if (!last || last.link != null) {
+        node.addInput(`encoded_${slots.length + 1}`, "ENCODED_PROMPT");
     } else {
-        // Remove any extra trailing empty slots (keep exactly one)
-        let trailingEmpty = 0;
-        for (let i = encSlots.length - 1; i >= 0; i--) {
-            if (encSlots[i].link == null) trailingEmpty++;
-            else break;
-        }
-        for (let i = 0; i < trailingEmpty - 1; i++) {
-            const toRemove = encSlots[encSlots.length - 1 - i];
-            const slotIdx = findInputSlot(node, toRemove.name);
-            if (slotIdx !== -1) node.removeInput(slotIdx);
+        // Walk backwards and remove extra trailing empties beyond the first
+        for (let i = slots.length - 2; i >= 0; i--) {
+            if (slots[i].link != null) break; // stop at first connected slot
+            const idx = node.inputs.indexOf(slots[i]);
+            if (idx !== -1) node.removeInput(idx);
         }
     }
 
-    // Update sel_{cat} COMBO options: [MERGE_ALL, ...connected node titles]
-    const titles = connectedSlots.map((s) => s.info.title);
+    // Update sel_{cat} COMBO options: [MERGE_ALL, ...titles of connected nodes]
     for (const w of node.widgets ?? []) {
         if (!w.name.startsWith("sel_")) continue;
         const cat = w.name.replace(/^sel_/, "");
 
-        // Build options: always include MERGE_ALL; add titles that contribute this category
         const opts = [MERGE_ALL_SENTINEL];
         for (const { info } of connectedSlots) {
+            // Include title if this source contributes the category (or if categories unknown)
             if (info.categories.length === 0 || info.categories.includes(cat)) {
                 opts.push(info.title);
             }
@@ -202,22 +196,28 @@ function refreshComboNode(node) {
 
         w.options = w.options ?? {};
         w.options.values = opts;
-
-        // Reset to MERGE_ALL if current value is no longer available
         if (!opts.includes(w.value)) w.value = MERGE_ALL_SENTINEL;
     }
 
-    node.graph?.setDirtyCanvas(true);
+    node.graph.setDirtyCanvas(true, true);
 }
 
 function setupComboNode(node) {
     const origOnConnectionsChange = node.onConnectionsChange?.bind(node);
     node.onConnectionsChange = function (type, index, connected, link_info) {
         if (origOnConnectionsChange) origOnConnectionsChange(type, index, connected, link_info);
-        refreshComboNode(node);
+        // Defer: graph.links is not yet updated when this callback fires
+        setTimeout(() => refreshComboNode(node), 0);
     };
 
-    // Initial refresh in case node is restored with existing connections
+    // Restore state when loading a saved workflow
+    const origOnConfigure = node.onConfigure?.bind(node);
+    node.onConfigure = function (info) {
+        if (origOnConfigure) origOnConfigure.call(this, info);
+        setTimeout(() => refreshComboNode(node), 0);
+    };
+
+    // Initial pass (deferred until node is in the graph)
     setTimeout(() => refreshComboNode(node), 0);
 }
 
