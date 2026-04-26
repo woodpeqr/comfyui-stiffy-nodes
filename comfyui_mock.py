@@ -213,11 +213,19 @@ def run_all(tmp_dir: Path):
     # ── Combo node ───────────────────────────────────────────────────────────
     print("\n── StiffyComboNode ──")
 
+    MERGE_ALL = node_logic.MERGE_ALL_SENTINEL
+
+    def _pnginfo(unique_id, source_map):
+        """Build minimal extra_pnginfo structure for combo node tests."""
+        return {"workflow": {"nodes": [{"id": unique_id, "properties": {"_source_map": source_map}}]}}
+
     def t_combo_merge():
         enc1 = node_logic.encode_prompts([Prompt(category="body", prompt="slim body"), Prompt(category="negative", prompt="blurry")])
         enc2 = node_logic.encode_prompts([Prompt(category="action", prompt="jumping"), Prompt(category="negative", prompt="low quality")])
         node = StiffyComboNode()
-        (merged,) = node.get_stiffy(encoded_1=enc1, encoded_2=enc2)
+        source_map = {"Node A": "encoded_1", "Node B": "encoded_2"}
+        pnginfo = _pnginfo("1", source_map)
+        (merged,) = node.get_stiffy(unique_id="1", extra_pnginfo=pnginfo, encoded_1=enc1, encoded_2=enc2)
         decoded = node_logic.decode_prompts(merged)
         cats = {p.category for p in decoded}
         assert "body" in cats and "action" in cats and "negative" in cats
@@ -227,7 +235,11 @@ def run_all(tmp_dir: Path):
         enc1 = node_logic.encode_prompts([Prompt(category="body", prompt="slim body")])
         enc2 = node_logic.encode_prompts([Prompt(category="body", prompt="curvy body")])
         node = StiffyComboNode()
-        (merged,) = node.get_stiffy(encoded_1=enc1, encoded_2=enc2, sel_body=1)
+        source_map = {"Node A": "encoded_1", "Node B": "encoded_2"}
+        pnginfo = _pnginfo("2", source_map)
+        # sel_body = "Node A" → only use encoded_1 for body category
+        (merged,) = node.get_stiffy(unique_id="2", extra_pnginfo=pnginfo,
+                                     encoded_1=enc1, encoded_2=enc2, sel_body="Node A")
         decoded = node_logic.decode_prompts(merged)
         body = next(p for p in decoded if p.category == "body")
         assert body.prompt == "slim body", f"got: {body.prompt!r}"

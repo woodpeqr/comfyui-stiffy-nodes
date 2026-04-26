@@ -3,12 +3,13 @@ from typing import List, Optional, Tuple
 from .constants import ENCODED_PROMPT_TYPE, NEGATIVE_CATEGORY, NEW_PRESET_SENTINEL
 from .models import Prompt
 from .node_logic import (
+    MERGE_ALL_SENTINEL,
     check_and_maybe_save_preset,
     decode_to_strings,
     encode_prompts,
     get_leaf_categories,
     list_preset_names,
-    merge_encoded_with_selections,
+    merge_encoded_with_name_selections,
 )
 
 
@@ -105,29 +106,51 @@ class StiffyComboNode:
     @classmethod
     def INPUT_TYPES(cls):
         cats = get_leaf_categories()
-        encoded_inputs = {
-            f"encoded_{i}": (ENCODED_PROMPT_TYPE, {"forceInput": True})
-            for i in range(1, 17)
-        }
         sel_widgets = {
-            f"sel_{cat}": ("INT", {"default": 0, "min": 0, "max": 16, "step": 1})
+            f"sel_{cat}": ([MERGE_ALL_SENTINEL], {"default": MERGE_ALL_SENTINEL})
             for cat in [*cats, NEGATIVE_CATEGORY]
         }
-        return {"optional": {**encoded_inputs, **sel_widgets}}
+        return {
+            "optional": {
+                "encoded_1": (ENCODED_PROMPT_TYPE, {"forceInput": True}),
+                **sel_widgets,
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
+        }
 
     RETURN_TYPES = (ENCODED_PROMPT_TYPE,)
     RETURN_NAMES = ("encoded_prompt",)
     CATEGORY = "stiffy"
     FUNCTION = "get_stiffy"
 
-    def get_stiffy(self, **kwargs) -> Tuple[str]:
+    def get_stiffy(self, unique_id=None, extra_pnginfo=None, **kwargs) -> Tuple[str]:
         cats = get_leaf_categories()
-        encoded_inputs = [kwargs.get(f"encoded_{i}") for i in range(1, 17)]
-        category_selections = {
-            cat: kwargs.get(f"sel_{cat}", 0)
+
+        # Build source_map from workflow JSON: {node_title: "encoded_N"}
+        source_map: dict = {}
+        if extra_pnginfo and unique_id is not None:
+            workflow_nodes = extra_pnginfo.get("workflow", {}).get("nodes", [])
+            for wnode in workflow_nodes:
+                if str(wnode.get("id")) == str(unique_id):
+                    source_map = wnode.get("properties", {}).get("_source_map", {})
+                    break
+
+        # Collect all encoded_N inputs from kwargs
+        encoded_by_key: dict = {}
+        for key, val in kwargs.items():
+            if key.startswith("encoded_") and val:
+                encoded_by_key[key] = val
+
+        # Collect per-category COMBO selections (node title or MERGE_ALL_SENTINEL)
+        category_selections: dict = {
+            cat: kwargs.get(f"sel_{cat}", MERGE_ALL_SENTINEL)
             for cat in [*cats, NEGATIVE_CATEGORY]
         }
-        return (merge_encoded_with_selections(encoded_inputs, category_selections),)
+
+        return (merge_encoded_with_name_selections(encoded_by_key, source_map, category_selections),)
 
 
 class StiffyDecoderNode:
