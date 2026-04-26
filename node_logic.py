@@ -197,28 +197,28 @@ def decode_to_strings(encoded: str, deduplicate: bool = False) -> Tuple[str, str
 MERGE_ALL_SENTINEL = "(merge all)"
 
 
-def merge_encoded_with_name_selections(
-    encoded_by_key: Dict[str, str],
-    source_map: Dict[str, str],
+def merge_encoded_with_list_selections(
+    encoded_list: List[str],
+    source_map: Dict[str, int],
     category_selections: Dict[str, str],
 ) -> str:
     """
-    Merge multiple encoded prompts into one, respecting per-category source selections.
+    Merge a list of encoded prompts into one, respecting per-category source selections.
 
-    encoded_by_key: {"encoded_1": yaml_str, "encoded_2": yaml_str, ...}
-    source_map: {"Node Title": "encoded_1", ...}  (JS-written, maps title → slot key)
+    encoded_list: ordered list of encoded yaml strings (index matches source_map values)
+    source_map: {"Node Title": 0-based-index, ...}  (JS-written, maps title → list index)
     category_selections: {"body": "Node Title", "action": "(merge all)", ...}
     """
-    if not encoded_by_key:
+    if not encoded_list:
         return ""
 
     category_parts: Dict[str, List[str]] = {}
-    for key, encoded in encoded_by_key.items():
+    for i, encoded in enumerate(encoded_list):
         if not encoded:
             continue
         for prompt in decode_prompts(encoded):
             sel = category_selections.get(prompt.category, MERGE_ALL_SENTINEL)
-            if sel != MERGE_ALL_SENTINEL and source_map.get(sel) != key:
+            if sel != MERGE_ALL_SENTINEL and source_map.get(sel) != i:
                 continue
             if prompt.prompt:
                 category_parts.setdefault(prompt.category, []).append(prompt.prompt)

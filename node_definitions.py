@@ -9,7 +9,7 @@ from .node_logic import (
     encode_prompts,
     get_leaf_categories,
     list_preset_names,
-    merge_encoded_with_name_selections,
+    merge_encoded_with_list_selections,
 )
 
 
@@ -103,6 +103,9 @@ class StiffyComplexPresetNode:
 
 
 class StiffyComboNode:
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (False,)
+
     @classmethod
     def INPUT_TYPES(cls):
         cats = get_leaf_categories()
@@ -112,7 +115,7 @@ class StiffyComboNode:
         }
         return {
             "optional": {
-                "encoded_1": (ENCODED_PROMPT_TYPE, {"forceInput": True}),
+                "encoded": (ENCODED_PROMPT_TYPE, {"forceInput": True}),
                 **sel_widgets,
             },
             "hidden": {
@@ -126,31 +129,31 @@ class StiffyComboNode:
     CATEGORY = "stiffy"
     FUNCTION = "get_stiffy"
 
-    def get_stiffy(self, unique_id=None, extra_pnginfo=None, **kwargs) -> Tuple[str]:
+    def get_stiffy(self, unique_id=None, extra_pnginfo=None, encoded=None, **kwargs) -> Tuple[str]:
         cats = get_leaf_categories()
 
-        # Build source_map from workflow JSON: {node_title: "encoded_N"}
+        encoded_list: List[str] = encoded if encoded else []
+
+        # Unwrap hidden inputs — with INPUT_IS_LIST they arrive as lists
+        uid = unique_id[0] if isinstance(unique_id, list) else unique_id
+        pnginfo = extra_pnginfo[0] if isinstance(extra_pnginfo, list) else extra_pnginfo
+
+        # Build source_map from workflow JSON: {node_title: 0-based-index}
         source_map: dict = {}
-        if extra_pnginfo and unique_id is not None:
-            workflow_nodes = extra_pnginfo.get("workflow", {}).get("nodes", [])
+        if pnginfo and uid is not None:
+            workflow_nodes = pnginfo.get("workflow", {}).get("nodes", [])
             for wnode in workflow_nodes:
-                if str(wnode.get("id")) == str(unique_id):
+                if str(wnode.get("id")) == str(uid):
                     source_map = wnode.get("properties", {}).get("_source_map", {})
                     break
 
-        # Collect all encoded_N inputs from kwargs
-        encoded_by_key: dict = {}
-        for key, val in kwargs.items():
-            if key.startswith("encoded_") and val:
-                encoded_by_key[key] = val
-
-        # Collect per-category COMBO selections (node title or MERGE_ALL_SENTINEL)
+        # Widget sel_* values are always single (not lists) even with INPUT_IS_LIST
         category_selections: dict = {
             cat: kwargs.get(f"sel_{cat}", MERGE_ALL_SENTINEL)
             for cat in [*cats, NEGATIVE_CATEGORY]
         }
 
-        return (merge_encoded_with_name_selections(encoded_by_key, source_map, category_selections),)
+        return (merge_encoded_with_list_selections(encoded_list, source_map, category_selections),)
 
 
 class StiffyDecoderNode:
