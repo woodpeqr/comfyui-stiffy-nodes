@@ -1,42 +1,32 @@
 from dataclasses import dataclass
-from datetime import datetime
-from decimal import InvalidOperation
-from functools import reduce
-import os
 from pathlib import Path
-from typing import Generic, List, Dict, Optional, Self, TextIO, Tuple, Type, Generator, Any, cast
+from typing import Dict, List, Optional, Self, Tuple
 
-import comfy.utils
-import comfy.sd
-
-from .utils import TK, TV, Cache, Lora, Model, Clip
-from .constants import ALL_CATEGORIES, CUST_STYLES_PATH, ROOT_DIR
-from .models import StyleList, CategoryList, Prompt, TModel, UNCATEGORIZED_CATEGORY_NAME
 import yaml
-import folder_paths
 
-import utils
+from .constants import NEGATIVE_CATEGORY, ROOT_DIR, USER_PRESETS_PATH
+from .models import CategoryList, Prompt
+
+
+# ─── File cache ───────────────────────────────────────────────────────────────
 
 @dataclass
-class CachedFile: 
+class CachedFile:
     time_modified: float
     contents: str
 
+
 class FileCache:
-    _items: Dict[Path, CachedFile] = dict()
+    _items: Dict[Path, CachedFile] = {}
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        pass
 
     def read(self) -> str:
         m_time = self.path.stat().st_mtime
-
-        if self.path in self._items.keys() and \
-            self._items[self.path].time_modified == m_time:
-            #print(f"{self.path} cache hit")
-            return self._items[self.path].contents
-        
+        cached = self._items.get(self.path)
+        if cached and cached.time_modified == m_time:
+            return cached.contents
         print(f"{self.path} cache miss")
         with open(self.path) as f:
             cf = CachedFile(contents=f.read(), time_modified=m_time)
@@ -46,8 +36,8 @@ class FileCache:
     def write(self, contents: str) -> None:
         with open(self.path, "w") as f:
             f.write(contents)
-    
-    def __enter__(self):
+
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -59,238 +49,180 @@ class FileCache:
             if create_if_does_not_exist:
                 path.touch()
             else:
-                raise InvalidOperation(f"{path} does not exist!")
-
+                raise FileNotFoundError(f"{path} does not exist!")
         if not path.is_file():
-            raise InvalidOperation(f"{path} is not a file!")
+            raise ValueError(f"{path} is not a file!")
         return cls(path)
 
     @classmethod
-    def clear(cls):
+    def clear(cls) -> None:
         cls._items.clear()
 
 
-class YamlLoader:
-    def __init__(self) -> None:
-        self.search_path: Path = ROOT_DIR
-        self.file_filter: str = "*.yaml"
+# ─── Category loading ─────────────────────────────────────────────────────────
 
-    def _load(self, model: Type[TModel], recursive: bool = False) -> List[TModel]: 
-        models = []
-        for file in self._get_yaml_files(recursive):
-            m = self._load_yaml_file(model, file)
-            if m is not None:
-                models.append(m)
-        return models
-
-    def _load_yaml_file(self, model: Type[TModel], path: Path) -> Optional[TModel]:
-        with FileCache.open(path) as f:
-            if (m := self._dict_from_yaml(model, f.read())) is not None:
-                return m
-
-    def _dict_from_yaml(self, model: Type[TModel], yml: str) -> Optional[TModel]:
-        raw = yaml.safe_load(yml)
-        return model.from_yaml(raw) if raw is not None else None
-
-    def _list_from_yaml(self, model: Type[TModel], yml: str | TextIO) -> Optional[List[TModel]]:
-        raw = yaml.safe_load(yml)
-        return model.collection_from_yaml(raw) if raw is not None else None
-
-    def _get_yaml_files(self, recursive: bool = False) -> Generator[Path, None, None]:
-        pattern = f"**/{self.file_filter}" if recursive else self.file_filter
-        return self.search_path.glob(pattern)
+_leaf_categories_cache: Optional[List[str]] = None
 
 
-class CategoryController(YamlLoader):
-    def __init__(self) -> None:
-        super().__init__()
-        self.file_filter = "categories.yaml"
-        self.category_list: CategoryList = self._load(CategoryList)[0] # TODO: maybe fix?
-        self.category_list.categories.append(UNCATEGORIZED_CATEGORY_NAME)
-
-    def get_categories(self) -> List[str]:
-        return self.category_list.categories
-
-    def find_category(self, name: str) -> Optional[str]:
-        for category in self.get_categories():
-            if category == name:
-                return category
-        return None
-
-                
-class PromptController(YamlLoader):
-    def __init__(self, category_controller: CategoryController) -> None:
-        super().__init__()
-        self.file_filter = "*style*.yaml"
-        self.search_path = self.search_path.joinpath("styles")
-
-        self.category_controller = category_controller
-        self.style_list: StyleList = reduce(lambda acc, s: StyleList(styles= acc.styles | s.styles), self._load(StyleList, True), StyleList(styles={}))
-
-        self.prompts: Dict[str, Prompt] = {cat: Prompt.empty(cat) for cat in self.category_controller.get_categories()}
-
-    def _get_actual_prompt_category(self, prompt: Prompt, categories: List[str]) -> str:
-        if prompt.category in categories:
-            return prompt.category
-        return UNCATEGORIZED_CATEGORY_NAME
-    
-    def _prompt_str_join(self, s1: Optional[str], s2: Optional[str]) -> str:
-        return ", ".join(s.strip(" ,") for s in [s1, s2] if s is not None and s != "")
-
-    def merge_prompts(self, p1: Prompt, p2: Prompt) -> Prompt:
-        categories = self.category_controller.get_categories()
-        c1, c2 = self._get_actual_prompt_category(p1, categories), self._get_actual_prompt_category(p2, categories)
-        if c1 != c2:
-            raise InvalidOperation(f"Cannot merge prompts of category {c1} and {c2}")
-        
-        return Prompt(
-            prompt=self._prompt_str_join(p1.prompt, p2.prompt),
-            negative_prompt=self._prompt_str_join(p1.negative_prompt, p2.negative_prompt),
-            category = c1)
-
-    def load_encoded_prompt(self, prompt: str):
-        decoded = self._list_from_yaml(Prompt, prompt)
-        for d in decoded if decoded is not None else []:
-            if d is not None:
-                self.load_prompt(d)
-    
-    def load_prompt(self, prompt: Prompt):
-        self.prompts[prompt.category] = self.merge_prompts(self.prompts[prompt.category], prompt)
-
-    def export_encoded(self) -> str:
-        return yaml.dump([p.model_dump() for p in self.prompts.values()])
-    
-    def export_decoded(self) -> Tuple[str, str]:
-        final_prompt = Prompt.empty(UNCATEGORIZED_CATEGORY_NAME)
-        for category in self.category_controller.category_list.categories:
-            prompt = self.prompts[category] 
-            final_prompt.prompt = self._prompt_str_join(final_prompt.prompt, prompt.prompt)
-            final_prompt.negative_prompt = self._prompt_str_join(final_prompt.negative_prompt, prompt.negative_prompt)
-        return (final_prompt.prompt if not final_prompt.prompt is None else "",
-        final_prompt.negative_prompt  if not final_prompt.negative_prompt is None else "")
-    
-    def apply_styles(self, styles: List[str], categorized: bool = True):
-        for style in styles:
-            style_prompt = self.style_list.styles.get(style, None)
-            if style_prompt is None:
-                raise Exception(f"{style} is not a valid style, probably a custom style that has been removed,\n"+ \
-                "in which case, unselect the style and refresh the page")
-            if not categorized:
-                style_prompt.category = UNCATEGORIZED_CATEGORY_NAME
-            self.prompts[style_prompt.category] = self.merge_prompts(self.prompts[style_prompt.category], style_prompt)
-
-    def _load_custom_style_list(self) -> StyleList:
-        sl: Optional[StyleList] = None
-        if CUST_STYLES_PATH.exists():
-            sl = self._load_yaml_file(StyleList, CUST_STYLES_PATH)
-        if sl is None:
-            sl = StyleList(styles=dict())
-        return sl
-
-    def _store_custom_style_list(self, sl: StyleList):
-        with FileCache.open(CUST_STYLES_PATH, True) as f:
-            f.write(yaml.dump({k: v.model_dump() for k, v in sl.styles.items()}))
-
-    def save_custom_style(self, name: str, prompt: Prompt):
-        sl = self._load_custom_style_list()
-        if name in self.style_list.styles.keys() and name not in sl.styles.keys():
-            raise Exception(f"style {name} is already defined somewhere else than {CUST_STYLES_PATH}!")
-
-        sl.styles[name] = prompt
-        self._store_custom_style_list(sl)
-
-    def remove_custom_style(self, name: str):
-        sl = self._load_custom_style_list()
-
-        if name not in sl.styles.keys():
-            return # nothing to do
-
-        del(sl.styles[name])
-        self._store_custom_style_list(sl)
+def get_leaf_categories() -> List[str]:
+    global _leaf_categories_cache
+    if _leaf_categories_cache is not None:
+        return _leaf_categories_cache
+    path = ROOT_DIR / "categories.yaml"
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    _leaf_categories_cache = CategoryList.from_yaml(raw).categories
+    return _leaf_categories_cache
 
 
-class NodeRunner:
-    def __init__(self) -> None:
-        self.category_controller: CategoryController = CategoryController()
-        self.prompt_controller: PromptController = PromptController(self.category_controller)
-        self.lora_cache: Cache[str, utils.Lora] = Cache()
+# ─── Preset storage ───────────────────────────────────────────────────────────
 
-#    def _get_category(self, category: str) -> str:
-#        cat = self.category_controller.find_category(category)
-#        if cat is None:
-#            print(f"{category} was not found, defaulting to {UNCATEGORIZED_CATEGORY_NAME}")
-#            cat = self.category_controller.find_category(UNCATEGORIZED_CATEGORY_NAME)
-#            if cat is None:
-#                raise Exception(f"{UNCATEGORIZED_CATEGORY_NAME} category does not exist????")
-#        return cat
+class PresetConflictError(Exception):
+    pass
 
-    def process_positive_prompt_input(self, prompt: str, is_encoded: bool, category: str = UNCATEGORIZED_CATEGORY_NAME ) -> Self:
-        if is_encoded:
-            self.prompt_controller.load_encoded_prompt(prompt)
-            return self
 
-        self.prompt_controller.load_prompt(Prompt(
-            prompt=prompt,
-            negative_prompt="",
-            category=category if category != "" else UNCATEGORIZED_CATEGORY_NAME
-        ))
-        return self;
+def _load_preset_storage() -> Dict[str, List[Prompt]]:
+    if not USER_PRESETS_PATH.exists():
+        return {}
+    fc = FileCache.open(USER_PRESETS_PATH)
+    raw = yaml.safe_load(fc.read())
+    if not raw:
+        return {}
+    return {
+        name: [Prompt(**entry) for entry in entries]
+        for name, entries in raw.items()
+        if entries
+    }
 
-    def process_negative_prompt_input(self, prompt: str) -> Self:
-        self.prompt_controller.load_prompt(Prompt(
-            prompt="",
-            negative_prompt=prompt,
-            category=UNCATEGORIZED_CATEGORY_NAME
-        ))
-        return self
 
-    def apply_styles(self, styles: Optional[List[str]], categorized: bool = True) -> Self:
-        if styles is not None:
-            self.prompt_controller.apply_styles(styles, categorized)
-        return self
+def _save_preset_storage(storage: Dict[str, List[Prompt]]) -> None:
+    USER_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fc = FileCache.open(USER_PRESETS_PATH, create_if_does_not_exist=True)
+    fc.write(yaml.dump(
+        {name: [p.model_dump() for p in prompts] for name, prompts in storage.items()},
+        default_flow_style=False,
+        allow_unicode=True,
+    ))
 
-    def save_style(self, name: str, category: str, positive_prompt: str, negative_prompt: str) -> Self:
-        if name != "":
-            if positive_prompt == "" and negative_prompt == "":
-                self.prompt_controller.remove_custom_style(name)
-            else:
-                self.prompt_controller.save_custom_style(name, Prompt(
-                    prompt=positive_prompt,
-                    negative_prompt=negative_prompt,
-                    category=category
-                ))
-        return self
 
-    def get_categories(self) -> List[str]:
-        return [c for c in self.category_controller.get_categories()]
+def load_preset(name: str) -> Optional[List[Prompt]]:
+    return _load_preset_storage().get(name)
 
-    def get_encoded_prompt(self) -> str:
-        return self.prompt_controller.export_encoded()
-    
-    def get_decoded_prompt(self) -> Tuple[str, str]:
-        return self.prompt_controller.export_decoded()
-    
-    def get_styles(self, category: str) -> List[str]:
-        if category == ALL_CATEGORIES:
-            return [k for k in self.prompt_controller.style_list.styles.keys()]
-        return [k for k, v in self.prompt_controller.style_list.styles.items() if v.category == category]
 
-    def get_lora_names(self) -> List[str]:
-        return folder_paths.get_filename_list("loras")
-    
-    def apply_loras(self, model: Model, clip: Clip, lora_names: List[str], model_strength: float, clip_strength: float) -> Tuple[Model, Clip]:
-        for lora_name in lora_names:
-            model, clip = self.apply_lora(model, clip, lora_name, model_strength, clip_strength)
-        return model, clip
+def save_preset(name: str, prompts: List[Prompt]) -> None:
+    storage = _load_preset_storage()
+    storage[name] = prompts
+    _save_preset_storage(storage)
 
-    def apply_lora(self, model: Model, clip: Clip, lora_name: str, model_strength: float, clip_strength: float) -> Tuple[Model, Clip]:
-        if model_strength == 0 and clip_strength == 0:
-            return (model, clip)
-        path = folder_paths.get_full_path_or_raise("loras", lora_name)
-        lora: Optional[Lora] = None
-        if self.lora_cache.contains(path):
-            lora = self.lora_cache.get(path) 
-        else:
-            lora = cast(Lora, comfy.utils.load_torch_file(path, safe_load=True))
-            self.lora_cache.set(path, lora)
-        return cast(Tuple[Model, Clip], comfy.sd.load_lora_for_models(model, clip, lora, model_strength, clip_strength))
+
+def list_preset_names(category: Optional[str] = None) -> List[str]:
+    storage = _load_preset_storage()
+    if category is None:
+        return list(storage.keys())
+    return [
+        name for name, prompts in storage.items()
+        if any(p.category == category for p in prompts)
+    ]
+
+
+def check_and_maybe_save_preset(
+    name: str,
+    prompts: List[Prompt],
+    do_save: bool,
+) -> None:
+    """Raise PresetConflictError if stored preset differs and do_save is False. Save if do_save is True."""
+    from .constants import NEW_PRESET_SENTINEL
+    if not name or name == NEW_PRESET_SENTINEL:
+        return
+    stored = load_preset(name)
+    if stored is not None:
+        stored_map = {p.category: p.prompt for p in stored}
+        new_map = {p.category: p.prompt for p in prompts}
+        if stored_map != new_map and not do_save:
+            raise PresetConflictError(
+                f"Preset '{name}' is stored with different content. "
+                "Enable 'save' to overwrite, or clear the preset name to use in-graph only."
+            )
+    if do_save:
+        save_preset(name, prompts)
+
+
+# ─── Prompt encoding ─────────────────────────────────────────────────────────
+
+def encode_prompts(prompts: List[Prompt]) -> str:
+    if not prompts:
+        return ""
+    return yaml.dump(
+        [p.model_dump() for p in prompts],
+        default_flow_style=False,
+        allow_unicode=True,
+    )
+
+
+def decode_prompts(encoded: str) -> List[Prompt]:
+    if not encoded:
+        return []
+    raw = yaml.safe_load(encoded)
+    if not raw:
+        return []
+    return [Prompt(**entry) for entry in raw]
+
+
+def join_prompt_strings(*parts: str) -> str:
+    return ", ".join(p.strip(" ,") for p in parts if p and p.strip(" ,"))
+
+
+def dedup_prompt_string(s: str) -> str:
+    seen: Dict[str, bool] = {}
+    result: List[str] = []
+    for token in (t.strip() for t in s.split(",")):
+        if token and token not in seen:
+            seen[token] = True
+            result.append(token)
+    return ", ".join(result)
+
+
+def decode_to_strings(encoded: str, deduplicate: bool = False) -> Tuple[str, str]:
+    prompts = decode_prompts(encoded)
+    positives = [p.prompt for p in prompts if p.category != NEGATIVE_CATEGORY and p.prompt]
+    negatives = [p.prompt for p in prompts if p.category == NEGATIVE_CATEGORY and p.prompt]
+    pos = join_prompt_strings(*positives)
+    neg = join_prompt_strings(*negatives)
+    if deduplicate:
+        pos = dedup_prompt_string(pos)
+        neg = dedup_prompt_string(neg)
+    return pos, neg
+
+
+def merge_encoded_with_selections(
+    encoded_inputs: List[Optional[str]],
+    category_selections: Dict[str, int],
+) -> str:
+    """
+    Merge multiple encoded prompts into one, respecting per-category source selections.
+
+    encoded_inputs: list of encoded strings, index 0 = input slot 1 (1-based externally)
+    category_selections: {category: 1-based input index}, 0 or absent = merge all sources
+    """
+    decoded: Dict[int, List[Prompt]] = {}
+    for i, enc in enumerate(encoded_inputs):
+        if enc:
+            decoded[i + 1] = decode_prompts(enc)
+
+    if not decoded:
+        return ""
+
+    category_parts: Dict[str, List[str]] = {}
+    for idx, prompts in decoded.items():
+        for prompt in prompts:
+            sel = category_selections.get(prompt.category, 0)
+            if sel != 0 and sel != idx:
+                continue
+            if prompt.prompt:
+                category_parts.setdefault(prompt.category, []).append(prompt.prompt)
+
+    result = [
+        Prompt(category=cat, prompt=join_prompt_strings(*parts))
+        for cat, parts in category_parts.items()
+    ]
+    return encode_prompts(result)
